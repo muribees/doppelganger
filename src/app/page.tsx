@@ -48,58 +48,68 @@ const CELEBRITIES: Celebrity[] = [
 ];
 
 /* ------------------------------------------------------------------ */
-/*  face-api.js helpers (loaded dynamically)                           */
+/*  @vladmandic/human — ArcFace 512-dim + liveness (loaded from CDN)  */
 /* ------------------------------------------------------------------ */
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let faceapi: any = null;
+let human: any = null;
 
-const MODEL_URL =
-  "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights";
+const HUMAN_CDN =
+  "https://cdn.jsdelivr.net/npm/@vladmandic/human/dist/human.esm.js";
+const MODEL_BASE =
+  "https://cdn.jsdelivr.net/npm/@vladmandic/human/models/";
+const LIVENESS_THRESHOLD = 0.5;
 
-async function loadFaceApi() {
-  if (faceapi) return faceapi;
-  const mod = await import(
-    // @ts-expect-error - no types for CDN module
-    /* webpackIgnore: true */ "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"
-  ).catch(() => null);
+async function initHuman() {
+  if (human) return human;
 
-  if (mod) {
-    faceapi = mod;
-  } else {
-    // fallback: load via script tag
-    await new Promise<void>((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src =
-        "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js";
-      s.onload = () => resolve();
-      s.onerror = reject;
-      document.head.appendChild(s);
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    faceapi = (window as any).faceapi;
-  }
+  // Dynamic ESM import from CDN — bypasses bundler entirely
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const H = await (Function('return import("' + HUMAN_CDN + '")')() as Promise<any>);
+  const Human = H.Human || H.default;
 
-  await Promise.all([
-    faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
-    faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
-    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
-  ]);
+  human = new Human({
+    modelBasePath: MODEL_BASE,
+    backend: "webgl",
+    face: {
+      enabled: true,
+      detector: { enabled: true, maxDetected: 1, rotation: false },
+      mesh: { enabled: true },
+      description: { enabled: true }, // ArcFace 512-dim embeddings
+      antispoof: { enabled: true },
+      liveness: { enabled: true },
+    },
+    body: { enabled: false },
+    hand: { enabled: false },
+    gesture: { enabled: false },
+    segmentation: { enabled: false },
+  });
 
-  return faceapi;
+  await human.load();
+  await human.warmup();
+  return human;
 }
 
-async function getDescriptor(
+async function getDescriptorAndLiveness(
   input: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement
-): Promise<Float32Array | null> {
-  const detection = await faceapi
-    .detectSingleFace(input)
-    .withFaceLandmarks()
-    .withFaceDescriptor();
-  return detection ? detection.descriptor : null;
+): Promise<{
+  descriptor: number[] | null;
+  live: number;
+  real: number;
+}> {
+  const result = await human.detect(input);
+  if (!result.face || result.face.length === 0) {
+    return { descriptor: null, live: 0, real: 0 };
+  }
+  const face = result.face[0];
+  return {
+    descriptor: face.embedding ?? null,
+    live: face.live ?? 0,
+    real: face.real ?? 0,
+  };
 }
 
-function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+function cosineSimilarity(a: number[], b: number[]): number {
   let dot = 0,
     na = 0,
     nb = 0;
@@ -120,12 +130,13 @@ export default function Home() {
   const [loadProgress, setLoadProgress] = useState("");
   const [results, setResults] = useState<MatchResult[]>([]);
   const [userPhoto, setUserPhoto] = useState<string | null>(null);
+  const [livenessScore, setLivenessScore] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const celebDescriptors = useRef<
-    { name: string; descriptor: Float32Array; image: string }[]
+    { name: string; descriptor: number[]; image: string }[]
   >([]);
 
   /* ---- Load models + celebrity embeddings ---- */
@@ -133,8 +144,8 @@ export default function Home() {
     setStage("loading-models");
     setError(null);
     try {
-      setLoadProgress("Loading face recognition models...");
-      await loadFaceApi();
+      setLoadProgress("Loading ArcFace recognition models...");
+      await initHuman();
 
       setLoadProgress("Processing celebrity faces...");
       const descriptors: typeof celebDescriptors.current = [];
@@ -149,11 +160,11 @@ export default function Home() {
           img.onerror = rej;
         });
 
-        const desc = await getDescriptor(img);
-        if (desc) {
+        const { descriptor } = await getDescriptorAndLiveness(img);
+        if (descriptor) {
           descriptors.push({
             name: celeb.name,
-            descriptor: desc,
+            descriptor,
             image: `/celebrities/${celeb.file}`,
           });
         }
@@ -184,7 +195,7 @@ export default function Home() {
       }
     } catch {
       setError(
-        "Camera access denied. Please allow camera access or upload a photo instead."
+        "Camera access denied. Please allow camera access in your browser settings and try again."
       );
       setStage("ready");
     }
@@ -208,38 +219,28 @@ export default function Home() {
     await findMatch(canvas);
   };
 
-  /* ---- Upload ---- */
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = async () => {
-      const dataUrl = reader.result as string;
-      setUserPhoto(dataUrl);
-
-      const img = new Image();
-      img.src = dataUrl;
-      await new Promise<void>((res) => (img.onload = () => res()));
-
-      const canvas = document.createElement("canvas");
-      canvas.width = img.width;
-      canvas.height = img.height;
-      canvas.getContext("2d")!.drawImage(img, 0, 0);
-      await findMatch(canvas);
-    };
-    reader.readAsDataURL(file);
-  };
-
   /* ---- Match ---- */
   const findMatch = async (canvas: HTMLCanvasElement) => {
     setStage("processing");
     setError(null);
 
-    const desc = await getDescriptor(canvas);
-    if (!desc) {
+    const { descriptor, live, real } = await getDescriptorAndLiveness(canvas);
+
+    if (!descriptor) {
       setError(
-        "No face detected in your photo. Try again with better lighting and face the camera directly."
+        "No face detected. Make sure your face is clearly visible and well-lit, then try again."
+      );
+      setStage("ready");
+      return;
+    }
+
+    // Liveness check
+    const livenessAvg = (live + real) / 2;
+    setLivenessScore(livenessAvg);
+
+    if (livenessAvg < LIVENESS_THRESHOLD) {
+      setError(
+        "Liveness check failed — please use a real face in front of the camera, not a photo or screen."
       );
       setStage("ready");
       return;
@@ -247,7 +248,7 @@ export default function Home() {
 
     const scored = celebDescriptors.current.map((c) => ({
       name: c.name,
-      similarity: cosineSimilarity(desc, c.descriptor),
+      similarity: cosineSimilarity(descriptor, c.descriptor),
       image: c.image,
     }));
     scored.sort((a, b) => b.similarity - a.similarity);
@@ -262,6 +263,7 @@ export default function Home() {
     streamRef.current = null;
     setUserPhoto(null);
     setResults([]);
+    setLivenessScore(null);
     setStage("ready");
   };
 
@@ -283,7 +285,12 @@ export default function Home() {
         {/* background glow */}
         <div
           className="absolute w-[600px] h-[600px] rounded-full opacity-20 blur-[120px] pointer-events-none"
-          style={{ background: "var(--accent)", top: "-10%", left: "50%", transform: "translateX(-50%)" }}
+          style={{
+            background: "var(--accent)",
+            top: "-10%",
+            left: "50%",
+            transform: "translateX(-50%)",
+          }}
         />
 
         <h1 className="text-5xl md:text-7xl font-extrabold tracking-tight mb-4 animate-fade-in-up">
@@ -294,8 +301,8 @@ export default function Home() {
           className="text-lg md:text-xl max-w-2xl mb-8 animate-fade-in-up"
           style={{ color: "var(--text-muted)", animationDelay: "0.15s" }}
         >
-          Discover which celebrity you look most like using real facial
-          recognition AI — running entirely in your browser.
+          Discover which celebrity you look most like using ArcFace recognition
+          with liveness detection — running entirely in your browser.
         </p>
 
         {stage === "hero" && (
@@ -314,18 +321,25 @@ export default function Home() {
 
         {stage === "loading-models" && (
           <div className="flex flex-col items-center gap-3 animate-fade-in-up">
-            <div className="w-8 h-8 border-3 border-t-transparent rounded-full animate-spin" style={{ borderColor: "var(--accent)", borderTopColor: "transparent" }} />
+            <div
+              className="w-8 h-8 border-3 border-t-transparent rounded-full animate-spin"
+              style={{
+                borderColor: "var(--accent)",
+                borderTopColor: "transparent",
+              }}
+            />
             <p style={{ color: "var(--text-muted)" }}>{loadProgress}</p>
           </div>
         )}
 
-        {error && (
-          <p className="mt-4 text-red-400 max-w-md">{error}</p>
-        )}
+        {error && <p className="mt-4 text-red-400 max-w-md">{error}</p>}
 
         {/* scroll hint */}
         {stage === "hero" && (
-          <div className="absolute bottom-8 animate-bounce" style={{ color: "var(--text-muted)" }}>
+          <div
+            className="absolute bottom-8 animate-bounce"
+            style={{ color: "var(--text-muted)" }}
+          >
             <p className="text-sm mb-1">Learn how it works</p>
             <svg
               className="mx-auto w-5 h-5"
@@ -350,7 +364,7 @@ export default function Home() {
           How Does a Computer Recognize a Face?
         </h2>
 
-        <div className="grid md:grid-cols-3 gap-6">
+        <div className="grid md:grid-cols-4 gap-6">
           {[
             {
               step: "1",
@@ -360,14 +374,20 @@ export default function Home() {
             },
             {
               step: "2",
-              title: "Embed",
-              desc: "The face is converted into 128 numbers — a unique fingerprint capturing eye spacing, nose shape, and more.",
-              icon: "🧬",
+              title: "Liveness",
+              desc: "Anti-spoofing AI checks you're a real person — not a photo, screen, or mask.",
+              icon: "🛡️",
             },
             {
               step: "3",
+              title: "Embed",
+              desc: "ArcFace converts your face into 512 numbers — a high-dimensional biometric fingerprint.",
+              icon: "🧬",
+            },
+            {
+              step: "4",
               title: "Compare",
-              desc: "We measure how close two sets of 128 numbers are using cosine similarity — 1 means identical, 0 means totally different.",
+              desc: "We measure how close two sets of 512 numbers are using cosine similarity.",
               icon: "📊",
             },
           ].map((item) => (
@@ -399,15 +419,23 @@ export default function Home() {
             borderColor: "var(--border)",
           }}
         >
-          <p className="font-mono text-sm mb-2" style={{ color: "var(--text-muted)" }}>
+          <p
+            className="font-mono text-sm mb-2"
+            style={{ color: "var(--text-muted)" }}
+          >
             Your face →
           </p>
-          <p className="font-mono text-xs md:text-sm break-all" style={{ color: "var(--accent-light)" }}>
-            [0.023, -0.145, 0.089, 0.234, -0.012, 0.178, ... 128 numbers total]
+          <p
+            className="font-mono text-xs md:text-sm break-all"
+            style={{ color: "var(--accent-light)" }}
+          >
+            [0.023, -0.145, 0.089, 0.234, -0.012, 0.178, ... 512 numbers
+            total]
           </p>
           <p className="mt-3 text-sm" style={{ color: "var(--text-muted)" }}>
-            This is the <strong>exact same technology</strong> used by Face ID,
-            Instagram filters, and airport security.
+            <strong style={{ color: "var(--text)" }}>ArcFace</strong> produces
+            4x more detail than older FaceNet models (512 vs 128 dimensions),
+            powering the same class of tech behind Face ID and airport security.
           </p>
         </div>
       </section>
@@ -417,8 +445,11 @@ export default function Home() {
         <h2 className="text-3xl md:text-4xl font-bold mb-3 text-center">
           The Comparison Database
         </h2>
-        <p className="text-center mb-10" style={{ color: "var(--text-muted)" }}>
-          15 public figures — the AI extracts 128 numbers from each face.
+        <p
+          className="text-center mb-10"
+          style={{ color: "var(--text-muted)" }}
+        >
+          15 public figures — ArcFace extracts 512 numbers from each face.
         </p>
         <div className="grid grid-cols-3 sm:grid-cols-5 gap-3">
           {CELEBRITIES.map((c) => (
@@ -434,7 +465,9 @@ export default function Home() {
                   loading="lazy"
                 />
               </div>
-              <p className="text-xs md:text-sm font-medium truncate">{c.name}</p>
+              <p className="text-xs md:text-sm font-medium truncate">
+                {c.name}
+              </p>
             </div>
           ))}
         </div>
@@ -445,17 +478,14 @@ export default function Home() {
         stage === "capturing" ||
         stage === "processing" ||
         stage === "results") && (
-        <section
-          id="try-it"
-          className="max-w-3xl mx-auto px-4 py-20"
-        >
+        <section id="try-it" className="max-w-3xl mx-auto px-4 py-20">
           <h2 className="text-3xl md:text-4xl font-bold mb-10 text-center">
             Find{" "}
             <span style={{ color: "var(--accent-light)" }}>Your</span>{" "}
             Doppelganger
           </h2>
 
-          {/* --- READY: show camera/upload options --- */}
+          {/* --- READY: scan button --- */}
           {stage === "ready" && (
             <div className="flex flex-col items-center gap-4">
               <button
@@ -463,24 +493,11 @@ export default function Home() {
                 className="px-8 py-4 text-lg font-semibold rounded-xl transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95"
                 style={{ background: "var(--accent)", color: "#fff" }}
               >
-                Use Camera
+                Scan Your Face
               </button>
-              <span style={{ color: "var(--text-muted)" }}>or</span>
-              <label
-                className="px-8 py-4 text-lg font-semibold rounded-xl cursor-pointer transition-all duration-200 hover:scale-105 border"
-                style={{
-                  borderColor: "var(--accent)",
-                  color: "var(--accent-light)",
-                }}
-              >
-                Upload a Photo
-                <input
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={handleUpload}
-                />
-              </label>
+              <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+                Live camera scan with liveness detection — no uploads allowed
+              </p>
               {error && <p className="text-red-400 text-sm mt-2">{error}</p>}
             </div>
           )}
@@ -489,7 +506,7 @@ export default function Home() {
           {stage === "capturing" && (
             <div className="flex flex-col items-center gap-4">
               <div
-                className="rounded-2xl overflow-hidden border"
+                className="rounded-2xl overflow-hidden border relative"
                 style={{ borderColor: "var(--accent)", borderWidth: 2 }}
               >
                 <video
@@ -499,7 +516,17 @@ export default function Home() {
                   muted
                   className="mirror w-full max-w-md"
                 />
+                {/* scanning overlay */}
+                <div className="absolute inset-0 pointer-events-none border-2 rounded-2xl" style={{ borderColor: "var(--green)", opacity: 0.4 }}>
+                  <div className="absolute top-4 left-4 w-8 h-8 border-t-2 border-l-2" style={{ borderColor: "var(--green)" }} />
+                  <div className="absolute top-4 right-4 w-8 h-8 border-t-2 border-r-2" style={{ borderColor: "var(--green)" }} />
+                  <div className="absolute bottom-4 left-4 w-8 h-8 border-b-2 border-l-2" style={{ borderColor: "var(--green)" }} />
+                  <div className="absolute bottom-4 right-4 w-8 h-8 border-b-2 border-r-2" style={{ borderColor: "var(--green)" }} />
+                </div>
               </div>
+              <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+                Position your face within the frame
+              </p>
               <button
                 onClick={capturePhoto}
                 className="px-8 py-4 text-lg font-semibold rounded-xl transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95"
@@ -530,7 +557,7 @@ export default function Home() {
                   }}
                 />
                 <p style={{ color: "var(--text-muted)" }}>
-                  Analyzing your face...
+                  Running liveness check &amp; ArcFace analysis...
                 </p>
               </div>
             </div>
@@ -539,6 +566,22 @@ export default function Home() {
           {/* --- RESULTS --- */}
           {stage === "results" && results.length > 0 && (
             <div className="animate-fade-in-up">
+              {/* Liveness badge */}
+              {livenessScore !== null && (
+                <div className="flex justify-center mb-6">
+                  <span
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm font-semibold"
+                    style={{
+                      background: "var(--surface)",
+                      color: "var(--green)",
+                      border: "1px solid var(--green)",
+                    }}
+                  >
+                    <span>&#10003;</span> Liveness verified ({(livenessScore * 100).toFixed(0)}%)
+                  </span>
+                </div>
+              )}
+
               {/* Top match hero */}
               <div
                 className="rounded-2xl p-8 border mb-8 text-center"
@@ -548,7 +591,10 @@ export default function Home() {
                   borderWidth: 2,
                 }}
               >
-                <p className="text-sm font-bold uppercase tracking-widest mb-4" style={{ color: "var(--accent-light)" }}>
+                <p
+                  className="text-sm font-bold uppercase tracking-widest mb-4"
+                  style={{ color: "var(--accent-light)" }}
+                >
                   Your Doppelganger
                 </p>
                 <div className="flex items-center justify-center gap-6 flex-wrap">
@@ -559,7 +605,10 @@ export default function Home() {
                       className="w-32 h-32 md:w-40 md:h-40 rounded-2xl object-cover"
                     />
                   )}
-                  <div className="text-4xl" style={{ color: "var(--accent-light)" }}>
+                  <div
+                    className="text-4xl"
+                    style={{ color: "var(--accent-light)" }}
+                  >
                     ≈
                   </div>
                   <img
@@ -584,10 +633,16 @@ export default function Home() {
                   borderColor: "var(--border)",
                 }}
               >
-                <div className="px-6 py-4 border-b" style={{ borderColor: "var(--border)" }}>
+                <div
+                  className="px-6 py-4 border-b"
+                  style={{ borderColor: "var(--border)" }}
+                >
                   <h3 className="font-bold">Full Ranking</h3>
                 </div>
-                <div className="divide-y" style={{ borderColor: "var(--border)" }}>
+                <div
+                  className="divide-y"
+                  style={{ borderColor: "var(--border)" }}
+                >
                   {results.map((r, i) => (
                     <div
                       key={r.name}
@@ -597,7 +652,10 @@ export default function Home() {
                       <span
                         className="w-6 text-right text-sm font-bold"
                         style={{
-                          color: i < 3 ? "var(--accent-light)" : "var(--text-muted)",
+                          color:
+                            i < 3
+                              ? "var(--accent-light)"
+                              : "var(--text-muted)",
                         }}
                       >
                         {i + 1}
@@ -607,7 +665,9 @@ export default function Home() {
                         alt={r.name}
                         className="w-10 h-10 rounded-lg object-cover"
                       />
-                      <span className="flex-1 font-medium text-sm">{r.name}</span>
+                      <span className="flex-1 font-medium text-sm">
+                        {r.name}
+                      </span>
                       <div className="w-24 md:w-40">
                         <div
                           className="h-2 rounded-full overflow-hidden"
@@ -647,7 +707,7 @@ export default function Home() {
                     color: "var(--accent-light)",
                   }}
                 >
-                  Try Again
+                  Scan Again
                 </button>
               </div>
             </div>
@@ -664,7 +724,10 @@ export default function Home() {
         <div className="grid md:grid-cols-2 gap-6 mb-10">
           {[
             { label: "Face ID", desc: "Unlocking your phone" },
-            { label: "Social Media", desc: "Photo tagging on Facebook/Instagram" },
+            {
+              label: "Social Media",
+              desc: "Photo tagging on Facebook/Instagram",
+            },
             { label: "Security", desc: "Airport & surveillance systems" },
             { label: "Filters", desc: "Snapchat & TikTok face filters" },
           ].map((item) => (
@@ -697,11 +760,13 @@ export default function Home() {
           </p>
           <p className="text-sm" style={{ color: "var(--text-muted)" }}>
             Your face embedding is a biometric fingerprint. Unlike a password,
-            you can&rsquo;t change your face. All processing on this site happens{" "}
+            you can&rsquo;t change your face. All processing on this site
+            happens{" "}
             <strong style={{ color: "var(--text)" }}>
               entirely in your browser
             </strong>{" "}
-            — no images are ever uploaded to a server.
+            — no images are ever uploaded to a server. Liveness detection
+            ensures only real, live faces are processed.
           </p>
         </div>
       </section>
@@ -711,7 +776,8 @@ export default function Home() {
         className="text-center py-8 border-t text-sm"
         style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
       >
-        Built with face-api.js &middot; All processing happens in your browser
+        Powered by ArcFace (512-dim) &middot; Liveness detection enabled
+        &middot; All processing happens in your browser
       </footer>
     </main>
   );
